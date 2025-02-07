@@ -32,28 +32,10 @@ func TestDetectorConfigIsValid(t *testing.T) {
 			err: "invalid SampleRate: valid values are 8000 and 16000",
 		},
 		{
-			name: "invalid WindowSize",
-			cfg: DetectorConfig{
-				ModelPath:  "../testfiles/silero_vad.onnx",
-				SampleRate: 16000,
-			},
-			err: "invalid WindowSize: valid values are 512, 1024, 1536 for 16000 sample rate and 256, 512, 768 for 8000 sample rate",
-		},
-		{
-			name: "invalid WindowSize for rate",
-			cfg: DetectorConfig{
-				ModelPath:  "../testfiles/silero_vad.onnx",
-				SampleRate: 16000,
-				WindowSize: 768,
-			},
-			err: "invalid WindowSize: valid values are 512, 1024, 1536 for 16000 sample rate and 256, 512, 768 for 8000 sample rate",
-		},
-		{
 			name: "invalid Threshold",
 			cfg: DetectorConfig{
 				ModelPath:  "../testfiles/silero_vad.onnx",
 				SampleRate: 16000,
-				WindowSize: 1536,
 				Threshold:  0,
 			},
 			err: "invalid Threshold: should be in range (0, 1)",
@@ -63,7 +45,6 @@ func TestDetectorConfigIsValid(t *testing.T) {
 			cfg: DetectorConfig{
 				ModelPath:            "../testfiles/silero_vad.onnx",
 				SampleRate:           16000,
-				WindowSize:           1536,
 				Threshold:            0.5,
 				MinSilenceDurationMs: -1,
 			},
@@ -74,7 +55,6 @@ func TestDetectorConfigIsValid(t *testing.T) {
 			cfg: DetectorConfig{
 				ModelPath:   "../testfiles/silero_vad.onnx",
 				SampleRate:  16000,
-				WindowSize:  1536,
 				Threshold:   0.5,
 				SpeechPadMs: -1,
 			},
@@ -85,7 +65,6 @@ func TestDetectorConfigIsValid(t *testing.T) {
 			cfg: DetectorConfig{
 				ModelPath:  "../testfiles/silero_vad.onnx",
 				SampleRate: 16000,
-				WindowSize: 1536,
 				Threshold:  0.5,
 			},
 		},
@@ -107,7 +86,6 @@ func TestNewDetector(t *testing.T) {
 	cfg := DetectorConfig{
 		ModelPath:  "../testfiles/silero_vad.onnx",
 		SampleRate: 16000,
-		WindowSize: 1536,
 		Threshold:  0.5,
 	}
 
@@ -123,7 +101,6 @@ func TestSpeechDetection(t *testing.T) {
 	cfg := DetectorConfig{
 		ModelPath:  "../testfiles/silero_vad.onnx",
 		SampleRate: 16000,
-		WindowSize: 1536,
 		Threshold:  0.5,
 	}
 
@@ -140,13 +117,19 @@ func TestSpeechDetection(t *testing.T) {
 		require.NoError(t, sd.Destroy())
 	}()
 
-	data, err := os.ReadFile("../testfiles/samples.pcm")
-	require.NoError(t, err)
+	readSamplesFromFile := func(path string) []float32 {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
 
-	samples := make([]float32, 0, len(data)/4)
-	for i := 0; i < len(data); i += 4 {
-		samples = append(samples, math.Float32frombits(binary.LittleEndian.Uint32(data[i:i+4])))
+		samples := make([]float32, 0, len(data)/4)
+		for i := 0; i < len(data); i += 4 {
+			samples = append(samples, math.Float32frombits(binary.LittleEndian.Uint32(data[i:i+4])))
+		}
+		return samples
 	}
+
+	samples := readSamplesFromFile("../testfiles/samples.pcm")
+	samples2 := readSamplesFromFile("../testfiles/samples2.pcm")
 
 	t.Run("detect", func(t *testing.T) {
 		segments, err := sd.Detect(samples)
@@ -155,15 +138,32 @@ func TestSpeechDetection(t *testing.T) {
 		require.Equal(t, []Segment{
 			{
 				SpeechStartAt: 1.056,
-				SpeechEndAt:   1.728,
+				SpeechEndAt:   1.632,
 			},
 			{
 				SpeechStartAt: 2.88,
-				SpeechEndAt:   3.264,
+				SpeechEndAt:   3.232,
 			},
 			{
-				SpeechStartAt: 4.416,
+				SpeechStartAt: 4.448,
 				SpeechEndAt:   0,
+			},
+		}, segments)
+
+		err = sd.Reset()
+		require.NoError(t, err)
+
+		segments, err = sd.Detect(samples2)
+		require.NoError(t, err)
+		require.NotEmpty(t, segments)
+		require.Equal(t, []Segment{
+			{
+				SpeechStartAt: 3.008,
+				SpeechEndAt:   6.24,
+			},
+			{
+				SpeechStartAt: 7.072,
+				SpeechEndAt:   8.16,
 			},
 		}, segments)
 	})
@@ -178,14 +178,14 @@ func TestSpeechDetection(t *testing.T) {
 		require.Equal(t, []Segment{
 			{
 				SpeechStartAt: 1.056,
-				SpeechEndAt:   1.728,
+				SpeechEndAt:   1.632,
 			},
 			{
 				SpeechStartAt: 2.88,
-				SpeechEndAt:   3.264,
+				SpeechEndAt:   3.232,
 			},
 			{
-				SpeechStartAt: 4.416,
+				SpeechStartAt: 4.448,
 				SpeechEndAt:   0,
 			},
 		}, segments)
@@ -206,14 +206,14 @@ func TestSpeechDetection(t *testing.T) {
 		require.Equal(t, []Segment{
 			{
 				SpeechStartAt: 1.056 - 0.01,
-				SpeechEndAt:   1.728 + 0.01,
+				SpeechEndAt:   1.632 + 0.01,
 			},
 			{
 				SpeechStartAt: 2.88 - 0.01,
-				SpeechEndAt:   3.264 + 0.01,
+				SpeechEndAt:   3.232 + 0.01,
 			},
 			{
-				SpeechStartAt: 4.416 - 0.01,
+				SpeechStartAt: 4.448 - 0.01,
 				SpeechEndAt:   0,
 			},
 		}, segments)

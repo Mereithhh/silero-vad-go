@@ -12,7 +12,35 @@ import (
 )
 
 const (
-	hcLen = 2 * 1 * 64
+	stateLen   = 2 * 1 * 128
+	contextLen = 64
+)
+
+type LogLevel int
+
+func (l LogLevel) OrtLoggingLevel() C.OrtLoggingLevel {
+	switch l {
+	case LevelVerbose:
+		return C.ORT_LOGGING_LEVEL_VERBOSE
+	case LogLevelInfo:
+		return C.ORT_LOGGING_LEVEL_INFO
+	case LogLevelWarn:
+		return C.ORT_LOGGING_LEVEL_WARNING
+	case LogLevelError:
+		return C.ORT_LOGGING_LEVEL_ERROR
+	case LogLevelFatal:
+		return C.ORT_LOGGING_LEVEL_FATAL
+	default:
+		return C.ORT_LOGGING_LEVEL_WARNING
+	}
+}
+
+const (
+	LevelVerbose LogLevel = iota + 1
+	LogLevelInfo
+	LogLevelWarn
+	LogLevelError
+	LogLevelFatal
 )
 
 type DetectorConfig struct {
@@ -20,14 +48,14 @@ type DetectorConfig struct {
 	ModelPath string
 	// The sampling rate of the input audio samples. Supported values are 8000 and 16000.
 	SampleRate int
-	// The number of samples to process at each infer.
-	WindowSize int
 	// The probability threshold above which we detect speech. A good default is 0.5.
 	Threshold float32
 	// The duration of silence to wait for each speech segment before separating it.
 	MinSilenceDurationMs int
 	// The padding to add to speech segments to avoid aggressive cutting.
 	SpeechPadMs int
+	// The loglevel for the onnx environment, by default it is set to LogLevelWarn.
+	LogLevel LogLevel
 }
 
 func (c DetectorConfig) IsValid() error {
@@ -37,11 +65,6 @@ func (c DetectorConfig) IsValid() error {
 
 	if c.SampleRate != 8000 && c.SampleRate != 16000 {
 		return fmt.Errorf("invalid SampleRate: valid values are 8000 and 16000")
-	}
-
-	if (c.SampleRate == 16000 && c.WindowSize != 512 && c.WindowSize != 1024 && c.WindowSize != 1536) ||
-		(c.SampleRate == 8000 && c.WindowSize != 256 && c.WindowSize != 512 && c.WindowSize != 768) {
-		return fmt.Errorf("invalid WindowSize: valid values are 512, 1024, 1536 for 16000 sample rate and 256, 512, 768 for 8000 sample rate")
 	}
 
 	if c.Threshold <= 0 || c.Threshold >= 1 {
@@ -69,8 +92,8 @@ type Detector struct {
 
 	cfg DetectorConfig
 
-	h [hcLen]float32
-	c [hcLen]float32
+	state [stateLen]float32
+	ctx   [contextLen]float32
 
 	currSample int
 	triggered  bool
@@ -93,7 +116,7 @@ func NewDetector(cfg DetectorConfig) (*Detector, error) {
 	}
 
 	sd.cStrings["loggerName"] = C.CString("vad")
-	status := C.OrtApiCreateEnv(sd.api, C.ORT_LOGGING_LEVEL_WARNING, sd.cStrings["loggerName"], &sd.env)
+	status := C.OrtApiCreateEnv(sd.api, cfg.LogLevel.OrtLoggingLevel(), sd.cStrings["loggerName"], &sd.env)
 	defer C.OrtApiReleaseStatus(sd.api, status)
 	if status != nil {
 		return nil, fmt.Errorf("failed to create env: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
@@ -138,11 +161,9 @@ func NewDetector(cfg DetectorConfig) (*Detector, error) {
 
 	sd.cStrings["input"] = C.CString("input")
 	sd.cStrings["sr"] = C.CString("sr")
-	sd.cStrings["h"] = C.CString("h")
-	sd.cStrings["c"] = C.CString("c")
+	sd.cStrings["state"] = C.CString("state")
+	sd.cStrings["stateN"] = C.CString("stateN")
 	sd.cStrings["output"] = C.CString("output")
-	sd.cStrings["hn"] = C.CString("hn")
-	sd.cStrings["cn"] = C.CString("cn")
 
 	return &sd, nil
 }
@@ -168,7 +189,12 @@ func (sd *Detector) Detect(pcm []float32) ([]Segment, error) {
 		return nil, fmt.Errorf("invalid nil detector")
 	}
 
-	if len(pcm) < sd.cfg.WindowSize {
+	windowSize := 512
+	if sd.cfg.SampleRate == 8000 {
+		windowSize = 256
+	}
+
+	if len(pcm) < windowSize {
 		return nil, fmt.Errorf("not enough samples")
 	}
 
@@ -178,13 +204,13 @@ func (sd *Detector) Detect(pcm []float32) ([]Segment, error) {
 	speechPadSamples := sd.cfg.SpeechPadMs * sd.cfg.SampleRate / 1000
 
 	var segments []Segment
-	for i := 0; i < len(pcm)-sd.cfg.WindowSize; i += sd.cfg.WindowSize {
-		speechProb, err := sd.infer(pcm[i : i+sd.cfg.WindowSize])
+	for i := 0; i < len(pcm)-windowSize; i += windowSize {
+		speechProb, err := sd.infer(pcm[i : i+windowSize])
 		if err != nil {
 			return nil, fmt.Errorf("infer failed: %w", err)
 		}
 
-		sd.currSample += sd.cfg.WindowSize
+		sd.currSample += windowSize
 
 		if speechProb >= sd.cfg.Threshold && sd.tempEnd != 0 {
 			sd.tempEnd = 0
@@ -192,7 +218,7 @@ func (sd *Detector) Detect(pcm []float32) ([]Segment, error) {
 
 		if speechProb >= sd.cfg.Threshold && !sd.triggered {
 			sd.triggered = true
-			speechStartAt := (float64(sd.currSample-sd.cfg.WindowSize-speechPadSamples) / float64(sd.cfg.SampleRate))
+			speechStartAt := (float64(sd.currSample-windowSize-speechPadSamples) / float64(sd.cfg.SampleRate))
 
 			// We clamp at zero since due to padding the starting position could be negative.
 			if speechStartAt < 0 {
@@ -241,12 +267,18 @@ func (sd *Detector) Reset() error {
 	sd.currSample = 0
 	sd.triggered = false
 	sd.tempEnd = 0
-	for i := 0; i < hcLen; i++ {
-		sd.h[i] = 0
-		sd.c[i] = 0
+	for i := 0; i < stateLen; i++ {
+		sd.state[i] = 0
+	}
+	for i := 0; i < contextLen; i++ {
+		sd.ctx[i] = 0
 	}
 
 	return nil
+}
+
+func (sd *Detector) SetThreshold(value float32) {
+	sd.cfg.Threshold = value
 }
 
 func (sd *Detector) Destroy() error {
